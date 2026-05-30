@@ -1,139 +1,392 @@
-
 import base64
 import hashlib
 import hmac
 import html
 import json
-from datetime import datetime
+import time
+import uuid
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
-from urllib.parse import urlencode
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import requests
+import urllib3
 
 from app.core.config import settings
 
+# LOCAL SANDBOX ONLY.
+# This avoids corporate proxy/self-signed certificate issues during local testing.
+# Do NOT keep verify=False / disabled warnings for production.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 
 class TeleCashService:
+    """
+    Fiserv / TeleCash sandbox Checkout Solution integration.
+
+    Flow:
+      1. Backend creates a checkout transaction.
+      2. Fiserv returns checkout.redirectionUrl.
+      3. Frontend opens that URL in a new tab.
+
+    Keep TELECASH_BASE_URL as:
+      https://prod.emea.api.fiservapps.com/sandbox
+
+    Do not include /exp/v1 in the .env value.
+    """
+
     def __init__(self) -> None:
-        self.connect_url = settings.TELECASH_CONNECT_URL.strip()
-        self.store_name = settings.TELECASH_STORE_NAME.strip()
-        self.shared_secret = settings.TELECASH_SHARED_SECRET
-        self.timezone = settings.TELECASH_TIMEZONE.strip() or "Europe/Berlin"
-        self.payment_method = (settings.TELECASH_PAYMENT_METHOD or "").strip()
-        self.language = (settings.TELECASH_LANGUAGE or "de_DE").strip() or "de_DE"
-        self.checkout_option = (settings.TELECASH_CHECKOUT_OPTION or "combinedpage").strip() or "combinedpage"
-        self.checkout_mode = (settings.TELECASH_CHECKOUT_MODE or "").strip()
-        self.bcountry = (settings.TELECASH_BCOUNTRY or "AT").strip() or "AT"
+        self.base_url = (
+            (getattr(settings, "TELECASH_BASE_URL", "") or "")
+            .strip()
+            .strip('"')
+            .strip("'")
+            .rstrip("/")
+        )
+        self.api_key = (
+            (getattr(settings, "TELECASH_API_KEY", "") or "")
+            .strip()
+            .strip('"')
+            .strip("'")
+        )
+        self.api_secret = (
+            getattr(settings, "TELECASH_API_SECRET", "") or ""
+        ).strip().strip('"').strip("'")
+        self.store_id = (
+            (getattr(settings, "TELECASH_STORE_ID", "") or "")
+            .strip()
+            .strip('"')
+            .strip("'")
+        )
 
-    def _currency_numeric(self, currency: str) -> str:
-        mapping = {
-            "EUR": "978",
-            "USD": "840",
-            "GBP": "826",
-            "CHF": "756",
-        }
-        return mapping.get((currency or "EUR").upper(), "978")
+    def _format_amount_decimal(self, amount: Any) -> Decimal:
+        value = amount if isinstance(amount, Decimal) else Decimal(str(amount))
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-    def _format_amount(self, amount: Any) -> str:
-        if isinstance(amount, Decimal):
-            value = amount
-        else:
-            value = Decimal(str(amount))
-        return str(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    def _format_amount_number(self, amount: Any) -> float:
+        return float(self._format_amount_decimal(amount))
 
-    def _txndatetime(self) -> str:
-        try:
-            return datetime.now(ZoneInfo(self.timezone)).strftime("%Y:%m:%d-%H:%M:%S")
-        except ZoneInfoNotFoundError:
-            # Windows often needs the tzdata package; fall back to local time instead of crashing checkout
-            return datetime.now().strftime("%Y:%m:%d-%H:%M:%S")
-
-    def _sorted_hash_string(self, fields: dict[str, str]) -> str:
-        items = [(k, str(v)) for k, v in fields.items() if str(v) != "" and k != "hashExtended"]
-        items.sort(key=lambda kv: kv[0])
-        return "|".join(v for _, v in items)
-
-    def _hmac_b64(self, payload_string: str) -> str:
+    def _hmac_b64(self, payload_string: str, *, secret: str | None = None) -> str:
         digest = hmac.new(
-            self.shared_secret.encode("utf-8"),
+            (secret if secret is not None else self.api_secret).encode("utf-8"),
             payload_string.encode("utf-8"),
             hashlib.sha256,
         ).digest()
         return base64.b64encode(digest).decode("utf-8")
 
-    def build_connect_request(self, *, order: Any) -> dict[str, Any]:
-        txndatetime = self._txndatetime()
-        currency_numeric = self._currency_numeric(order.currency)
-        chargetotal = self._format_amount(order.total_amount)
-        base_return = settings.TELECASH_RETURN_BASE_URL.rstrip("/")
-        success_return = f"{base_return}?result=success"
-        fail_return = f"{base_return}?result=failure"
+    def _checkout_create_url(self) -> str:
+        """
+        Fiserv sandbox checkout endpoint.
 
-        fields: dict[str, str] = {
-            "txntype": "sale",
-            "timezone": self.timezone,
-            "txndatetime": txndatetime,
-            "hash_algorithm": "HMACSHA256",
-            "storename": self.store_name,
-            "checkoutoption": self.checkout_option,
-            "oid": order.id,
-            "chargetotal": chargetotal,
-            "currency": currency_numeric,
-            "responseSuccessURL": success_return,
-            "responseFailURL": fail_return,
-            "responseURL": success_return,
-            "language": self.language,
-            "bname": order.customer_name,
-            "email": order.customer_email,
-            "bcountry": self.bcountry,
-        }
+        TELECASH_BASE_URL should be:
+          https://prod.emea.api.fiservapps.com/sandbox
 
-        if self.checkout_mode:
-            fields["mode"] = self.checkout_mode
-        if self.payment_method:
-            fields["paymentMethod"] = self.payment_method
+        Final endpoint becomes:
+          https://prod.emea.api.fiservapps.com/sandbox/exp/v1/
+        """
+        if not self.base_url:
+            raise ValueError("TELECASH_BASE_URL is required for Fiserv Checkout.")
 
-        notification = (settings.TELECASH_NOTIFICATION_URL or "").strip()
-        if notification.lower().startswith("https://"):
-            fields["transactionNotificationURL"] = notification
+        base = self.base_url.rstrip("/")
 
-        fields["hashExtended"] = self._hmac_b64(self._sorted_hash_string(fields))
+        if base.endswith("/exp/v1"):
+            return f"{base}/checkouts"
 
-        resume_url = f"{base_return.rsplit('/return', 1)[0]}/resume/{order.id}"
+        return f"{base}/exp/v1/checkouts"
+
+    def _backend_return_url(self, result: str, order_id: str) -> str:
+        base = settings.TELECASH_RETURN_BASE_URL.rstrip("/")
+        separator = "&" if "?" in base else "?"
+        return f"{base}{separator}result={result}&order_id={order_id}"
+
+    def _json_body(self, payload: dict[str, Any]) -> str:
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+    def _fiserv_headers(self, body_string: str) -> dict[str, str]:
+        client_request_id = str(uuid.uuid4())
+        timestamp = str(int(time.time() * 1000))
+
+        # Fiserv EMEA signature pattern:
+        # Api-Key + Client-Request-Id + Timestamp + request body
+        raw_signature = f"{self.api_key}{client_request_id}{timestamp}{body_string}"
+        signature = self._hmac_b64(raw_signature, secret=self.api_secret)
+
         return {
-            "ok": True,
-            "status_code": 200,
-            "payload": {
-                "provider": "telecash_connect",
-                "action": self.connect_url,
-                "fields": fields,
-                "txndatetime": txndatetime,
-            },
-            "redirect_url": resume_url,
-            "payment_link_id": None,
-            "action": self.connect_url,
-            "fields": fields,
-            "txndatetime": txndatetime,
+            "Content-Type": "application/json",
+            "Api-Key": self.api_key,
+            "Client-Request-Id": client_request_id,
+            "Timestamp": timestamp,
+            "Message-Signature": signature,
         }
+
+    def _build_checkout_payload(self, *, order: Any) -> dict[str, Any]:
+        """
+        Minimal checkout payload accepted by Fiserv Checkout API.
+
+        Important:
+        The sandbox schema rejects cancelUrl inside checkoutSettings.redirectBackUrls.
+        Only successUrl and failureUrl are sent here.
+        """
+        payload: dict[str, Any] = {
+            "storeId": self.store_id,
+            "transactionType": "SALE",
+            "transactionOrigin": "ECOM",
+            "merchantTransactionId": order.id,
+            "transactionAmount": {
+                "currency": order.currency or "EUR",
+                "total": self._format_amount_number(order.total_amount),
+            },
+            "checkoutSettings": {
+                "locale": "de_DE",
+                "redirectBackUrls": {
+                    "successUrl": self._backend_return_url("success", order.id),
+                    "failureUrl": self._backend_return_url("failure", order.id),
+                },
+            },
+        }
+
+        notification_url = (settings.TELECASH_NOTIFICATION_URL or "").strip()
+
+        # Fiserv cannot call localhost. Only send webhook URL if it is public HTTPS.
+        if notification_url and notification_url.startswith("https://"):
+            payload["checkoutSettings"]["webHooksUrl"] = notification_url
+
+        return payload
+
+    def _find_checkout_redirect_url(self, value: Any) -> str | None:
+        if not isinstance(value, dict):
+            return None
+
+        checkout = value.get("checkout")
+        if isinstance(checkout, dict):
+            redirect = (
+                checkout.get("redirectionUrl")
+                or checkout.get("redirectionURL")
+                or checkout.get("redirectUrl")
+                or checkout.get("redirectURL")
+            )
+            if isinstance(redirect, str) and redirect.startswith(("http://", "https://")):
+                return redirect
+
+        return self._find_any_url(value)
+
+    def _find_checkout_id(self, value: Any) -> str | None:
+        if not isinstance(value, dict):
+            return None
+
+        checkout = value.get("checkout")
+        if isinstance(checkout, dict):
+            checkout_id = (
+                checkout.get("checkoutId")
+                or checkout.get("checkoutID")
+                or checkout.get("id")
+            )
+            if checkout_id:
+                return str(checkout_id)
+
+        candidates = [
+            value.get("checkoutId"),
+            value.get("checkoutID"),
+            value.get("transactionId"),
+            value.get("ipgTransactionId"),
+            value.get("id"),
+            value.get("orderId"),
+        ]
+
+        for candidate in candidates:
+            if candidate:
+                return str(candidate)
+
+        for nested_value in value.values():
+            if isinstance(nested_value, dict):
+                found = self._find_checkout_id(nested_value)
+                if found:
+                    return found
+            elif isinstance(nested_value, list):
+                for item in nested_value:
+                    if isinstance(item, dict):
+                        found = self._find_checkout_id(item)
+                        if found:
+                            return found
+
+        return None
+
+    def _find_any_url(self, value: Any) -> str | None:
+        if isinstance(value, str):
+            if value.startswith(("http://", "https://")):
+                return value
+            return None
+
+        if isinstance(value, dict):
+            preferred_keys = [
+                "redirectionUrl",
+                "redirectionURL",
+                "redirectUrl",
+                "redirectURL",
+                "checkoutUrl",
+                "checkoutURL",
+                "hostedPaymentPageUrl",
+                "hostedPaymentPageURL",
+                "paymentUrl",
+                "paymentURL",
+                "url",
+                "href",
+            ]
+
+            for key in preferred_keys:
+                found = self._find_any_url(value.get(key))
+                if found:
+                    return found
+
+            links = value.get("links") or value.get("_links")
+            found = self._find_any_url(links)
+            if found:
+                return found
+
+            for nested_value in value.values():
+                found = self._find_any_url(nested_value)
+                if found:
+                    return found
+
+        if isinstance(value, list):
+            for item in value:
+                found = self._find_any_url(item)
+                if found:
+                    return found
+
+        return None
+
+    def build_connect_request(self, *, order: Any) -> dict[str, Any]:
+        """
+        Keep this method name so the rest of the backend does not need to know
+        whether we use old TeleCash Connect or Fiserv Checkout Solution.
+        """
+        return self.build_checkout_request(order=order)
+
+    def build_payment_link_request(self, *, order: Any) -> dict[str, Any]:
+        """
+        Backwards-compatible alias because order_service may still call the old method name.
+        """
+        return self.build_checkout_request(order=order)
+
+    def build_checkout_request(self, *, order: Any) -> dict[str, Any]:
+        if not all([self.base_url, self.api_key, self.api_secret, self.store_id]):
+            return {
+                "ok": False,
+                "status_code": 500,
+                "payload": {
+                    "provider": "fiserv_checkout",
+                    "error": "Missing Fiserv API-key configuration.",
+                    "config_present": {
+                        "base_url": bool(self.base_url),
+                        "api_key": bool(self.api_key),
+                        "api_secret": bool(self.api_secret),
+                        "store_id": bool(self.store_id),
+                    },
+                },
+                "redirect_url": None,
+                "payment_link_id": None,
+                "checkout_id": None,
+                "action": None,
+                "fields": {},
+                "txndatetime": None,
+            }
+
+        endpoint = self._checkout_create_url()
+        request_payload = self._build_checkout_payload(order=order)
+        body_string = self._json_body(request_payload)
+        headers = self._fiserv_headers(body_string)
+
+        try:
+            response = requests.post(
+                endpoint,
+                data=body_string.encode("utf-8"),
+                headers=headers,
+                timeout=30,
+                verify=False,  # LOCAL SANDBOX ONLY. Remove for production.
+            )
+
+            try:
+                response_body: Any = response.json()
+            except ValueError:
+                response_body = {"raw": response.text}
+
+            redirect_url = self._find_checkout_redirect_url(response_body)
+            checkout_id = self._find_checkout_id(response_body)
+
+            print("========== FISERV CHECKOUT DEBUG ==========")
+            print("Endpoint:", endpoint)
+            print("Status:", response.status_code)
+            print("Request:", json.dumps(request_payload, indent=2, ensure_ascii=False))
+            print("Response:", json.dumps(response_body, indent=2, ensure_ascii=False))
+            print("Redirect URL:", redirect_url)
+            print("Checkout ID:", checkout_id)
+            print("==========================================")
+
+            ok = response.status_code in {200, 201} and bool(redirect_url)
+
+            return {
+                "ok": ok,
+                "status_code": response.status_code,
+                "payload": {
+                    "provider": "fiserv_checkout",
+                    "endpoint": endpoint,
+                    "request": request_payload,
+                    "response": response_body,
+                    "headers": self.sanitize_headers(headers),
+                    "diagnostic": {
+                        "redirect_url_found": bool(redirect_url),
+                        "checkout_id_found": bool(checkout_id),
+                        "checkout_id": checkout_id,
+                        "http_status": response.status_code,
+                    },
+                },
+                "redirect_url": redirect_url,
+                "payment_link_id": checkout_id,
+                "checkout_id": checkout_id,
+                "action": endpoint,
+                "fields": {},
+                "txndatetime": headers["Timestamp"],
+            }
+
+        except requests.RequestException as exc:
+            print("========== FISERV CHECKOUT ERROR ==========")
+            print("Endpoint:", endpoint)
+            print("Error:", str(exc))
+            print("==========================================")
+
+            return {
+                "ok": False,
+                "status_code": 0,
+                "payload": {
+                    "provider": "fiserv_checkout",
+                    "endpoint": endpoint,
+                    "request": request_payload,
+                    "error": str(exc),
+                    "headers": self.sanitize_headers(headers),
+                },
+                "redirect_url": None,
+                "payment_link_id": None,
+                "checkout_id": None,
+                "action": None,
+                "fields": {},
+                "txndatetime": None,
+            }
 
     def verify_response_hash(self, payload: dict[str, Any], *, notification: bool = False) -> bool:
-        hash_field = "notification_hash" if notification else "response_hash"
-        received = str(payload.get(hash_field) or "").strip()
-        if not received:
-            return False
-        required = [
-            str(payload.get("approval_code") or ""),
-            str(payload.get("chargetotal") or ""),
-            str(payload.get("currency") or ""),
-            str(payload.get("txndatetime") or payload.get("hiddenTxndatetime") or ""),
-            str(payload.get("storename") or payload.get("hiddenStorename") or self.store_name),
-        ]
-        if not all(required):
-            return False
-        expected = self._hmac_b64("|".join(required))
-        return hmac.compare_digest(received, expected)
+        """
+        Checkout webhooks/returns are not verified here yet.
+
+        For local sandbox testing this is intentionally permissive because:
+        - localhost notification URLs cannot be called by Fiserv servers
+        - the current frontend polling depends on our backend return route
+        """
+        return False
 
     def build_resume_html(self, *, action: str, fields: dict[str, Any]) -> str:
+        """
+        Legacy helper retained for compatibility with routes that may still call it.
+        Checkout Solution should normally return redirect_url and not use this form.
+        """
         inputs = "\n".join(
             f'<input type="hidden" name="{html.escape(str(k))}" value="{html.escape(str(v))}" />'
             for k, v in fields.items()
@@ -152,8 +405,7 @@ class TeleCashService:
 </body>
 </html>"""
 
-
     @staticmethod
-    def sanitize_fields(fields: dict[str, str]) -> dict[str, str]:
-        hidden = {"hashExtended"}
-        return {k: ("***" if k in hidden else str(v)) for k, v in fields.items()}
+    def sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
+        hidden = {"Api-Key", "Message-Signature"}
+        return {k: ("***" if k in hidden else str(v)) for k, v in headers.items()}
